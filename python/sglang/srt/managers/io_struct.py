@@ -17,6 +17,7 @@ processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
 import copy
+import dataclasses
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
@@ -1636,3 +1637,50 @@ def _check_all_req_types():
 
 
 _check_all_req_types()
+
+@dataclasses.dataclass
+class AbandonReq:
+    """Control plane message: ask scheduler to migrate/abandon a request on this node."""
+    rid: str
+    req_id: str  # unique id for this abandon call, so TokenizerManager can match ack
+
+    # migration target info (you can evolve later)
+    dst_http: Optional[str] = None
+    dst_node: Optional[str] = None
+    bootstrap_room: Optional[int] = None
+    reason: Optional[str] = None
+
+    # policy: after snapshot started / finished, whether scheduler should stop this rid locally
+    abort_local: bool = True
+
+
+@dataclasses.dataclass
+class AbandonReqOutput:
+    """Ack message from scheduler back to tokenizer manager."""
+    rid: str
+    req_id: str
+    success: bool
+    message: str = ""
+
+@dataclasses.dataclass
+class AdoptReq:
+    """Control plane message: ask scheduler to adopt a migrated request from shared store."""
+    ticket: str
+    req_id: str  # unique id for this adopt call, so TokenizerManager can match ack
+
+    timeout_s: float = 60.0
+    auto_inject: bool = True
+
+    # ---- TP / sharded adopt ----
+    kv_key_suffix: Optional[str] = None   # e.g. "tp0" / "tp1"
+    wait_kv_done: bool = True
+
+
+@dataclasses.dataclass
+class AdoptReqOutput:
+    """Ack message from scheduler back to tokenizer manager."""
+    ticket: str
+    req_id: str
+    success: bool
+    message: str = ""
+    result: Optional[Dict[str, Any]] = None
