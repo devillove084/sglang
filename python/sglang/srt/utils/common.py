@@ -3741,6 +3741,13 @@ def get_current_device_stream_fast():
 
 
 def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
+    try:
+        if hasattr(strict, "get"):
+            strict = strict.get()
+    except Exception:
+        # if anything weird, fall back to original value
+        pass
+
     if strict:
         raise ValueError(message)
     else:

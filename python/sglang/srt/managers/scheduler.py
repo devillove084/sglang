@@ -13,7 +13,9 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import asyncio
 import faulthandler
+import inspect
 import logging
 import os
 import signal
@@ -25,6 +27,7 @@ from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+import uuid
 
 import psutil
 import setproctitle
@@ -115,6 +118,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    AbandonReq,
+    AbandonReqOutput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -194,6 +199,10 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
+from python.sglang.srt.managers.io_struct import AdoptReq, AdoptReqOutput
+from sglang.srt.kv_store.file_kv_store import FileKVStore
+from sglang.srt.migration.file_p2p.engine import FileP2PMigrationEngine
+
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -206,6 +215,15 @@ GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 @dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
+
+@dataclass
+class AbandonRequestState:
+    rid: str
+    req: Req
+    where: str                       # e.g. "waiting", "running_batch", "cur_batch", ...
+    index: Optional[int] = None      # index in container list if applicable
+    batch: Optional[ScheduleBatch] = None
+    extra: Any = None                # disagg item / queue / metadata
 
 
 class Scheduler(
@@ -586,7 +604,25 @@ class Scheduler(
                 (GetLoadReqInput, self.get_load),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (AbandonReq, self.handle_abandon_request),
+                (AdoptReq,self.handle_adopt_request),
             ]
+        )
+
+        self._init_migration_engine()
+
+    def _init_migration_engine(self):
+        store_dir = "/tmp/sglang_mig"
+        node_name = getattr(self.server_args, "node_name", None) or os.environ.get(
+            "SGLANG_NODE_NAME", "node"
+        )
+
+        store = FileKVStore(root_dir=store_dir)
+        # 每个 rank 都要有 engine（因为每个 rank 都要 dump/import 自己那份 KV shard）
+        self.migration_engine = FileP2PMigrationEngine(
+            scheduler=self,
+            store=store,
+            node_name=f"{node_name}-tp{self.tp_rank}-pp{self.pp_rank}",
         )
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
@@ -2425,6 +2461,247 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+
+    def _abort_request_internal(self, rid: str, finished_reason: dict):
+        """Abort a request locally using the existing abort path (free pages/kv/etc)."""
+        # Follow AbortReq pattern: reuse abort_request() logic
+        abort_req = AbortReq(
+            finished_reason=finished_reason,
+            rid=rid,
+            abort_all=False,
+        )
+        self.abort_request(abort_req)
+
+
+    def _tp_leader(self) -> bool:
+        return self.tp_group.rank_in_group == 0
+
+    def _tp_barrier(self):
+        if self.tp_size > 1:
+            torch.dist.barrier(group=self.tp_cpu_group)
+
+    def _sync_for_migration(self):
+        if self.device != "cpu":
+            torch.cuda.synchronize()
+
+    def handle_abandon_request(self, req: AbandonReq):
+        rid = req.rid
+        ok = False
+        msg = ""
+        detail = None
+
+        try:
+            if self.migration_engine is None:
+                raise RuntimeError("migration_engine is not enabled/initialized")
+
+            if self.pp_size != 1:
+                raise RuntimeError("file_p2p migration v0 only supports pp_size==1 for now")
+
+            peer_url = getattr(req, "dst_http", None) or getattr(req, "peer_url", None)
+            if not peer_url:
+                raise RuntimeError("AbandonReq missing dst_http/peer_url")
+
+            timeout_s = float(getattr(req, "timeout_s", 60.0))
+
+            # 1) (可选) 做一个轻量 sync，避免正在写 KV 时 dump
+            # tp=1 时先简单 cuda sync；更严格的 safe-point 以后再做
+            if getattr(self, "device", None) != "cpu":
+                torch.cuda.synchronize()
+
+            # 2) dump + notify，但不要 finalize（避免和 abort 路径 double free）
+            ret = self.migration_engine.abandon_req_to_peer(
+                rid=rid,
+                peer_url=peer_url,
+                timeout_s=timeout_s,
+                ticket=getattr(req, "ticket", None),
+                kv_key_suffix=None,          # tp=1
+                write_req_state=True,
+                write_done=True,
+                notify=True,
+                finalize=False,              # <<< 关键：不在这里释放
+                allow_running=True,          # 你现在就是要在 decode 中迁移；后面再做更严格 safe-point
+            )
+
+            if getattr(req, "abort_local", True):
+                # 走 abort_request 统一清理（remove + free）
+                self._abort_request_internal(
+                    rid,
+                    finished_reason={
+                        "type": "abort",
+                        "message": f"abandoned/migrated: {(getattr(req,'reason',None) or '').strip()}".strip(),
+                        "status_code": 499,
+                    },
+                )
+
+            ok = True
+            msg = "migration triggered"
+            detail = {
+                "ticket": ret.get("ticket"),
+                "peer_url": peer_url,
+                "notify_ok": ret.get("notify_ok"),
+                "notify_err": ret.get("notify_err"),
+                "kv_key": ret.get("kv_key"),
+            }
+
+        except Exception as e:
+            ok = False
+            msg = f"exception in handle_abandon_request: {e}"
+
+        out = AbandonReqOutput(
+            rid=rid,
+            req_id=getattr(req, "req_id", ""),
+            success=ok,
+            message=msg if detail is None else f"{msg} | {detail}",
+        )
+        self.send_to_tokenizer.send_output(out, req)
+        return None
+
+
+    # def handle_abandon_request(self, req: AbandonReq):
+    #     rid = req.rid
+    #     ok = False
+    #     msg = ""
+    #     detail = None
+
+    #     try:
+    #         if self.migration_engine is None:
+    #             raise RuntimeError("migration_engine is not enabled/initialized")
+
+    #         if self.pp_size != 1:
+    #             raise RuntimeError("file_p2p migration v0 only supports pp_size==1 for now")
+
+    #         peer_url = getattr(req, "dst_http", None) or getattr(req, "peer_url", None)
+    #         if not peer_url:
+    #             raise RuntimeError("AbandonReq missing dst_http/peer_url")
+
+    #         timeout_s = float(getattr(req, "timeout_s", 60.0))
+
+    #         # 1) 生成并广播 ticket（保证所有 TP rank 用同一个前缀）
+    #         if getattr(req, "ticket", None):
+    #             ticket = req.ticket
+    #         else:
+    #             ticket = f"{rid}-{uuid.uuid4().hex}" if self._tp_leader() else None
+    #             ticket = broadcast_pyobj(
+    #                 ticket,
+    #                 self.tp_group.rank,
+    #                 self.tp_cpu_group,
+    #                 src=self.tp_group.ranks[0],
+    #             )
+
+    #         # 2) 确保此刻 KV 稳定：GPU sync + TP barrier
+    #         self._sync_for_migration()
+    #         self._tp_barrier()
+
+    #         # 3) 每个 TP rank dump 自己的 shard
+    #         #    这里要求你把 engine 改成支持 kv_key_suffix / write_done / notify / finalize 的参数（下一节给）
+    #         dump_ret = self.migration_engine.abandon_req_to_peer(
+    #             rid=rid,
+    #             peer_url=peer_url,
+    #             timeout_s=timeout_s,
+    #             ticket=ticket,
+    #             kv_key_suffix=f"tp{self.tp_rank}",   # <<< 关键：避免覆盖
+    #             write_done=False,
+    #             notify=False,
+    #             finalize=False,
+    #             allow_running=True,
+    #         )
+
+    #         self._tp_barrier()
+
+    #         # 4) leader 写 DONE + 通知 B（只一次）
+    #         notify_ok = True
+    #         notify_err = None
+    #         if self._tp_leader():
+    #             self.migration_engine.store.put(f"mig/{ticket}/DONE", {"t": time.time(), "rid": rid, "tp_size": self.tp_size})
+    #             notify_ok, notify_err = self.migration_engine._notify_peer_adopt(ticket, peer_url, timeout_s)  # 你也可以做成 public
+
+    #         # 把 notify 结果广播给所有 rank（便于日志一致）
+    #         if self.tp_size > 1:
+    #             obj = {"notify_ok": notify_ok, "notify_err": notify_err}
+    #             obj = broadcast_pyobj(obj, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0])
+    #             notify_ok, notify_err = obj["notify_ok"], obj["notify_err"]
+
+    #         self._tp_barrier()
+
+    #         # 5) 所有 rank 本地 finalize：移除 req + free slots
+    #         # self.migration_engine._finalize_abandon(dump_ret["req_obj"])
+    #         if req.abort_local:
+    #             self._abort_request_internal(rid)
+    #         else:
+    #             self.migration_engine._finalize_abandon(dump_ret["req_obj"])
+
+    #         ok = True
+    #         msg = "migration triggered"
+    #         detail = {
+    #             "ticket": ticket,
+    #             "peer_url": peer_url,
+    #             "notify_ok": notify_ok,
+    #             "notify_err": notify_err,
+    #         }
+
+    #         # 6) 可选：对外 abort（这会给用户返回 AbortReq，通常你们想要“迁走但不对外报错”时就别开）
+    #         if getattr(req, "abort_local", False):
+    #             self._abort_request_internal(
+    #                 rid,
+    #                 finished_reason={
+    #                     "type": "abort",
+    #                     "message": f"abandoned/migrated: {(getattr(req,'reason',None) or '').strip()}".strip(),
+    #                     "status_code": HTTPStatus.CLIENT_CLOSED_REQUEST,  # 499
+    #                 },
+    #             )
+
+    #     except Exception as e:
+    #         ok = False
+    #         msg = f"exception in handle_abandon_request: {e}"
+
+    #     # 7) 回 ack：只有 entry rank 实际有 send socket（其他 rank 的 SenderWrapper(None) 会 no-op）
+    #     out = AbandonReqOutput(
+    #         rid=rid,
+    #         req_id=getattr(req, "req_id", None),
+    #         success=ok,
+    #         message=msg if detail is None else f"{msg} | {detail}",
+    #     )
+    #     self.send_to_tokenizer.send_output(out, req)
+    #     return None
+
+    def handle_adopt_request(self, req: AdoptReq):
+        ok = False
+        msg = ""
+        result = None
+
+        try:
+            if self.migration_engine is None:
+                raise RuntimeError("migration_engine is not enabled/initialized")
+
+            # 如果你后面做 TP：建议默认 suffix=tp{rank}
+            kv_key_suffix = getattr(req, "kv_key_suffix", None)
+            wait_kv_done = bool(getattr(req, "wait_kv_done", True))
+
+            # 执行 adopt（读 store -> alloc -> import -> inject）
+            result = self.migration_engine.adopt_req_from_store(
+                ticket=req.ticket,
+                timeout_s=float(getattr(req, "timeout_s", 60.0)),
+                auto_inject=bool(getattr(req, "auto_inject", True)),
+                kv_key_suffix=kv_key_suffix,
+                wait_kv_done=wait_kv_done,
+            )
+
+            ok = True
+            msg = "adopt ok"
+
+        except Exception as e:
+            ok = False
+            msg = f"exception in handle_adopt_request: {e}"
+
+        out = AdoptReqOutput(
+            ticket=req.ticket,
+            req_id=req.req_id,
+            success=ok,
+            message=msg,
+            result=result,
+        )
+        self.send_to_tokenizer.send_output(out, req)
+        return None
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

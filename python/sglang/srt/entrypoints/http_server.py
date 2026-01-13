@@ -321,6 +321,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from sglang.srt.migration.file_p2p.router import attach_file_p2p_routes
+
+attach_file_p2p_routes(
+    app,
+    get_global_state=lambda: _global_state,
+    node_name=os.environ.get("SGLANG_NODE_NAME", "node"),
+)
+
 
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):

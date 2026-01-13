@@ -70,6 +70,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
+    AbandonReq,
+    AbandonReqOutput,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -111,6 +113,8 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+from python.sglang.srt.managers.io_struct import AdoptReq, AdoptReqOutput
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -313,7 +317,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Request states
         self._chosen_loop = None
         self.rid_to_state: Dict[str, ReqState] = {}
+        # Abandon/migration acks: req_id -> Future[AbandonReqOutput]
+        self._abandon_futures: Dict[str, asyncio.Future] = {}
         self.asyncio_tasks = set()
+        self._adopt_futures = {}
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -414,6 +421,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     self._handle_batch_output,
                 ),
                 (AbortReq, self._handle_abort_req),
+                (AbandonReqOutput, self._handle_abandon_req_output),
+                (AdoptReqOutput,self._handle_adopt_req_output),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -1260,6 +1269,165 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.metrics_collector.observe_one_aborted_request(
                 self.metrics_collector.labels
             )
+
+    async def abandon_req(
+        self,
+        rid: str,
+        dst_http: Optional[str] = None,
+        bootstrap_room: Optional[int] = None,
+        reason: Optional[str] = None,
+        dst_node: Optional[str] = None,
+        abort_local: bool = True,
+        timeout_s: float = 5.0,
+    ) -> Dict[str, Any]:
+        """
+        Trigger request migration/abandon on scheduler side.
+
+        Returns:
+            {"success": bool, "message": str, "rid": rid, "req_id": req_id}
+        """
+        self.auto_create_handle_loop()
+
+        # 允许 rid 不存在时也能返回明确错误（比如已经 finished）
+        if rid not in self.rid_to_state:
+            return {
+                "success": False,
+                "message": f"rid not found in tokenizer_manager: {rid}",
+                "rid": rid,
+                "req_id": "",
+            }
+
+        # 生成一个 req_id（不用 uuid，避免引入额外依赖；用时间+线程+rid 也够唯一）
+        req_id = f"abandon_{rid}_{int(time.time()*1e9)}_{threading.get_ident()}"
+
+        # fut = self.event_loop.create_future()
+        # self._abandon_futures[req_id] = fut
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._abandon_futures[req_id] = (loop, fut)
+
+        req = AbandonReq(
+            rid=rid,
+            req_id=req_id,
+            dst_http=dst_http,
+            dst_node=dst_node,
+            bootstrap_room=bootstrap_room,
+            reason=reason,
+            abort_local=abort_local,
+        )
+
+        # 发给 scheduler（跟 abort_request 一样走 send_to_scheduler）
+        self.send_to_scheduler.send_pyobj(req)
+
+        try:
+            out: AbandonReqOutput = await asyncio.wait_for(fut, timeout=timeout_s)
+            return {
+                "success": out.success,
+                "message": out.message,
+                "rid": out.rid,
+                "req_id": out.req_id,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "message": f"timeout waiting abandon ack from scheduler (timeout_s={timeout_s})",
+                "rid": rid,
+                "req_id": req_id,
+            }
+        finally:
+            self._abandon_futures.pop(req_id, None)
+
+    def _handle_abandon_req_output(self, recv_obj: AbandonReqOutput):
+        # fut = self._abandon_futures.get(recv_obj.req_id, None)
+        # if fut is None:
+        #     logger.warning(
+        #         f"Received AbandonReqOutput but no future found. {recv_obj.req_id=} {recv_obj.rid=}"
+        #     )
+        #     return
+        # if not fut.done():
+        #     fut.set_result(recv_obj)
+        item = self._abandon_futures.get(recv_obj.req_id, None)
+        if item is None:
+            logger.warning(
+                f"Received AbandonReqOutput but no future found. {recv_obj.req_id=} {recv_obj.rid=}"
+            )
+            return
+        loop, fut = item
+        if not fut.done():
+            loop.call_soon_threadsafe(fut.set_result, recv_obj)
+
+    async def adopt_req(
+        self,
+        ticket: str,
+        timeout_s: float = 300.0,
+        auto_inject: bool = True,
+        kv_key_suffix: Optional[str] = None,
+        wait_kv_done: bool = True,
+        ipc_timeout_s: float = 300.0,   # 等 scheduler ack 的超时（跟 store timeout 不同）
+    ) -> Dict[str, Any]:
+        """
+        Ask scheduler to adopt migrated request from shared store.
+
+        Returns:
+        {"success": bool, "message": str, "ticket": ticket, "req_id": req_id, "result": {...}|None}
+        """
+        self.auto_create_handle_loop()
+
+        if not ticket:
+            return {
+                "success": False,
+                "message": "ticket is empty",
+                "ticket": ticket,
+                "req_id": "",
+                "result": None,
+            }
+
+        req_id = f"adopt_{ticket}_{int(time.time()*1e9)}_{threading.get_ident()}"
+
+        fut = self.event_loop.create_future()
+        self._adopt_futures[req_id] = fut
+
+        req = AdoptReq(
+            ticket=ticket,
+            req_id=req_id,
+            timeout_s=float(timeout_s),
+            auto_inject=bool(auto_inject),
+            kv_key_suffix=kv_key_suffix,
+            wait_kv_done=bool(wait_kv_done),
+        )
+
+        self.send_to_scheduler.send_pyobj(req)
+
+        try:
+            out: AdoptReqOutput = await asyncio.wait_for(fut, timeout=ipc_timeout_s)
+            return {
+                "success": out.success,
+                "message": out.message,
+                "ticket": out.ticket,
+                "req_id": out.req_id,
+                "result": out.result,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "message": f"timeout waiting adopt ack from scheduler (ipc_timeout_s={ipc_timeout_s})",
+                "ticket": ticket,
+                "req_id": req_id,
+                "result": None,
+            }
+        finally:
+            self._adopt_futures.pop(req_id, None)
+
+
+    def _handle_adopt_req_output(self, recv_obj: "AdoptReqOutput"):
+        fut = self._adopt_futures.get(recv_obj.req_id, None)
+        if fut is None:
+            logger.warning(
+                f"Received AdoptReqOutput but no future found. {recv_obj.req_id=} {recv_obj.ticket=}"
+            )
+            return
+        if not fut.done():
+            fut.set_result(recv_obj)
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
